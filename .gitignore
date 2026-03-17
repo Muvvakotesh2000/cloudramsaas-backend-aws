@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 .env
 .env.*
-applications/
 *.log
 .DS_Store
 Thumbs.db
