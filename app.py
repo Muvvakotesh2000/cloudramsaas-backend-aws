@@ -29,14 +29,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="CloudRAMSaaS API", version="1.0.0", lifespan=lifespan)
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5000,http://127.0.0.1:5000")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5000,http://127.0.0.1:5000,https://cloudramsaas-frontend-aws.onrender.com")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS.split(",")],
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(router, prefix="/api/v1")
