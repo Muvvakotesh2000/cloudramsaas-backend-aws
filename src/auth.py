@@ -75,3 +75,25 @@ async def get_current_user(
         "role": user.get("role", "authenticated"),
         "token": token,
     }
+
+
+async def validate_token(token: str) -> dict | None:
+    """Validate a raw token string. Returns user dict or None."""
+    client = _get_client()
+    try:
+        resp = await client.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            },
+        )
+        if resp.status_code != 200:
+            return None
+        user = resp.json()
+        user_id = user.get("id")
+        if not user_id:
+            return None
+        return {"user_id": user_id, "email": user.get("email", "")}
+    except Exception:
+        return None

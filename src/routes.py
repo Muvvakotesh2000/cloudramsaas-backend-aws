@@ -12,12 +12,13 @@ from botocore.exceptions import ClientError
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel
 
-from src.auth import get_current_user
+from src.auth import get_current_user, validate_token
 from src.aws import generate_presigned_url, get_task_status, run_user_task, stop_user_task
 from src.db import (
     cleanup_expired_sessions,
     create_session,
     get_active_session,
+    get_session_by_arn,
     heartbeat_session,
     mark_session_stopped,
     update_session_status,
@@ -123,7 +124,7 @@ def _require_allowed_content_type(content_type: str):
 # =============================================================================
 # ECS poll helper
 # =============================================================================
-async def _poll_task_until_running(task_arn: str, max_attempts: int = 40):
+async def _poll_task_until_running(task_arn: str, user_id: str, max_attempts: int = 40):
     for attempt in range(max_attempts):
         await asyncio.sleep(5)
         info = await get_task_status(task_arn)
@@ -144,12 +145,70 @@ async def _poll_task_until_running(task_arn: str, max_attempts: int = 40):
         logger.info("Task %s → %s (attempt %d)", task_arn, ecs_status, attempt)
 
         if ecs_status == "RUNNING":
+            await _restore_projects_from_s3(user_id, task_arn)
             return
         if ecs_status in ("STOPPED", "DEPROVISIONING"):
             await mark_session_stopped(task_arn, reason="ecs_stopped_unexpectedly")
             return
 
     await mark_session_stopped(task_arn, reason="provision_timeout")
+
+
+async def _restore_projects_from_s3(user_id: str, task_arn: str):
+    """Scan S3 for user's previously uploaded projects and restore them."""
+    try:
+        prefix = f"users/{user_id}/vscode/"
+        response = await asyncio.to_thread(
+            s3_client.list_objects_v2,
+            Bucket="cloudramsaas-vscode",
+            Prefix=prefix,
+        )
+
+        contents = response.get("Contents", [])
+        project_keys = [
+            obj["Key"] for obj in contents
+            if obj["Key"].endswith(".zip") and "/_" not in obj["Key"] and "/exports/" not in obj["Key"]
+        ]
+
+        if not project_keys:
+            logger.info("No projects to restore for user %s", user_id)
+            return
+
+        session = await get_session_by_arn(task_arn)
+        if not session or not session.get("private_ip"):
+            return
+
+        vm_ip = session["private_ip"]
+        api_port = session.get("api_port", 7000)
+        headers = {}
+        if VM_API_KEY:
+            headers["X-VM-API-KEY"] = VM_API_KEY
+
+        for key in project_keys:
+            project_name = key.rsplit("/", 1)[-1].replace(".zip", "")
+            config_key = f"users/{user_id}/vscode/_empty_config.zip"
+
+            try:
+                async with httpx.AsyncClient(timeout=VM_HTTP_TIMEOUT) as client:
+                    resp = await client.post(
+                        f"http://{vm_ip}:{api_port}/setup_ide",
+                        json={
+                            "user_id": user_id,
+                            "project_name": project_name,
+                            "ide": "vscode",
+                            "project_s3_bucket": "cloudramsaas-vscode",
+                            "project_s3_key": key,
+                            "config_s3_bucket": "cloudramsaas-vscode",
+                            "config_s3_key": config_key,
+                        },
+                        headers=headers,
+                    )
+                logger.info("Restored project '%s' for user %s (status %d)", project_name, user_id, resp.status_code)
+            except Exception as e:
+                logger.warning("Failed to restore project '%s' for user %s: %s", project_name, user_id, e)
+
+    except Exception as e:
+        logger.warning("S3 project restore failed for user %s: %s", user_id, e)
 
 
 # =============================================================================
@@ -249,7 +308,7 @@ async def _do_allocate(user_id: str, background_tasks: BackgroundTasks) -> Sessi
     api_port = task_info.get("api_port")
 
     session = await create_session(user_id=user_id, task_arn=task_arn, novnc_port=novnc_port, api_port=api_port)
-    background_tasks.add_task(_poll_task_until_running, task_arn)
+    background_tasks.add_task(_poll_task_until_running, task_arn, user_id)
 
     return SessionResponse(
         session_id=str(session["id"]),
@@ -327,6 +386,30 @@ async def stop_session(user: dict = Depends(get_current_user)):
     if not stopped:
         raise HTTPException(status_code=500, detail="Failed to stop ECS task")
     await mark_session_stopped(session["task_arn"], reason="user_requested")
+
+
+@router.post("/sessions/beacon-stop", status_code=204)
+async def beacon_stop_session(request: Request):
+    """Stop session via navigator.sendBeacon (no Authorization header)."""
+    try:
+        body = await request.body()
+        token = body.decode("utf-8").strip()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Missing token")
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing token")
+
+    user = await validate_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    session = await get_active_session(user["user_id"])
+    if not session:
+        return
+
+    await stop_user_task(session["task_arn"], reason="tab_closed")
+    await mark_session_stopped(session["task_arn"], reason="tab_closed")
 
 
 # =============================================================================
