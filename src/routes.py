@@ -160,6 +160,22 @@ async def _poll_task_until_running(task_arn: str, user_id: str, max_attempts: in
     await mark_session_stopped(task_arn, reason="provision_timeout")
 
 
+async def _wait_for_container_api(vm_ip: str, api_port: int, headers: dict, max_wait: int = 60):
+    """Wait until the container API is accepting connections."""
+    for attempt in range(max_wait // 5):
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"http://{vm_ip}:{api_port}/health", headers=headers)
+                if resp.status_code < 500:
+                    logger.info("Container API ready at %s:%d (attempt %d)", vm_ip, api_port, attempt + 1)
+                    return True
+        except (httpx.ConnectError, httpx.TimeoutException):
+            pass
+        await asyncio.sleep(5)
+    logger.warning("Container API at %s:%d not ready after %ds", vm_ip, api_port, max_wait)
+    return False
+
+
 async def _restore_projects_from_s3(user_id: str, task_arn: str):
     """Scan S3 for user's previously uploaded projects and restore them."""
     try:
@@ -190,28 +206,39 @@ async def _restore_projects_from_s3(user_id: str, task_arn: str):
         if VM_API_KEY:
             headers["X-VM-API-KEY"] = VM_API_KEY
 
+        ready = await _wait_for_container_api(vm_ip, api_port, headers)
+        if not ready:
+            logger.error("Skipping project restore for user %s — container API never became ready", user_id)
+            return
+
         for key in project_keys:
             project_name = key.rsplit("/", 1)[-1].replace(".zip", "")
             config_key = f"users/{user_id}/vscode/_empty_config.zip"
 
-            try:
-                async with httpx.AsyncClient(timeout=VM_HTTP_TIMEOUT) as client:
-                    resp = await client.post(
-                        f"http://{vm_ip}:{api_port}/setup_ide",
-                        json={
-                            "user_id": user_id,
-                            "project_name": project_name,
-                            "ide": "vscode",
-                            "project_s3_bucket": "cloudramsaas-vscode",
-                            "project_s3_key": key,
-                            "config_s3_bucket": "cloudramsaas-vscode",
-                            "config_s3_key": config_key,
-                        },
-                        headers=headers,
-                    )
-                logger.info("Restored project '%s' for user %s (status %d)", project_name, user_id, resp.status_code)
-            except Exception as e:
-                logger.warning("Failed to restore project '%s' for user %s: %s", project_name, user_id, e)
+            last_err = None
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(timeout=VM_HTTP_TIMEOUT) as client:
+                        resp = await client.post(
+                            f"http://{vm_ip}:{api_port}/setup_ide",
+                            json={
+                                "user_id": user_id,
+                                "project_name": project_name,
+                                "ide": "vscode",
+                                "project_s3_bucket": "cloudramsaas-vscode",
+                                "project_s3_key": key,
+                                "config_s3_bucket": "cloudramsaas-vscode",
+                                "config_s3_key": config_key,
+                            },
+                            headers=headers,
+                        )
+                    logger.info("Restored project '%s' for user %s (status %d)", project_name, user_id, resp.status_code)
+                    break
+                except Exception as e:
+                    last_err = e
+                    await asyncio.sleep(3)
+            else:
+                logger.warning("Failed to restore project '%s' for user %s after 3 attempts: %s", project_name, user_id, last_err)
 
     except Exception as e:
         logger.warning("S3 project restore failed for user %s: %s", user_id, e)
