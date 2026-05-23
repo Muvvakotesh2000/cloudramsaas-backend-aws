@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import random
@@ -39,12 +40,16 @@ async def get_used_resources() -> tuple[list, list, list, list]:
     used_api     = []
     used_display = []
     try:
-        resp = ecs.list_tasks(cluster=ECS_CLUSTER, desiredStatus="RUNNING")
+        resp = await asyncio.to_thread(
+            ecs.list_tasks, cluster=ECS_CLUSTER, desiredStatus="RUNNING",
+        )
         task_arns = resp.get("taskArns", [])
         if not task_arns:
             return [], [], [], []
 
-        tasks_resp = ecs.describe_tasks(cluster=ECS_CLUSTER, tasks=task_arns)
+        tasks_resp = await asyncio.to_thread(
+            ecs.describe_tasks, cluster=ECS_CLUSTER, tasks=task_arns,
+        )
         for task in tasks_resp.get("tasks", []):
             for override in task.get("overrides", {}).get("containerOverrides", []):
                 for env in override.get("environment", []):
@@ -63,7 +68,7 @@ async def get_used_resources() -> tuple[list, list, list, list]:
                         except Exception:
                             pass
     except Exception:
-        pass
+        logger.warning("Failed to fetch used resources", exc_info=True)
 
     return used_novnc, used_vnc, used_api, used_display
 
@@ -83,7 +88,8 @@ async def run_user_task(user_id: str) -> dict:
             user_id, novnc_port, vnc_port, api_port, display
         )
 
-        resp = ecs.run_task(
+        resp = await asyncio.to_thread(
+            ecs.run_task,
             cluster=ECS_CLUSTER,
             taskDefinition=ECS_TASK_DEFINITION,
             capacityProviderStrategy=[
@@ -134,7 +140,9 @@ async def run_user_task(user_id: str) -> dict:
 
 async def get_task_status(task_arn: str) -> Optional[dict]:
     try:
-        resp  = ecs.describe_tasks(cluster=ECS_CLUSTER, tasks=[task_arn])
+        resp = await asyncio.to_thread(
+            ecs.describe_tasks, cluster=ECS_CLUSTER, tasks=[task_arn],
+        )
         tasks = resp.get("tasks", [])
         if not tasks:
             return None
@@ -147,7 +155,6 @@ async def get_task_status(task_arn: str) -> Optional[dict]:
         novnc_port: int = 6080
         api_port:   int = 5000
 
-        # Get ports from task override env
         for override in task.get("overrides", {}).get("containerOverrides", []):
             for env in override.get("environment", []):
                 if env["name"] == "NOVNC_PORT":
@@ -155,22 +162,24 @@ async def get_task_status(task_arn: str) -> Optional[dict]:
                 elif env["name"] == "API_PORT":
                     api_port = int(env["value"])
 
-        # Get EC2 host public IP
         container_instance_arn = task.get("containerInstanceArn")
         if container_instance_arn:
             try:
-                ci_resp = ecs.describe_container_instances(
+                ci_resp = await asyncio.to_thread(
+                    ecs.describe_container_instances,
                     cluster=ECS_CLUSTER,
-                    containerInstances=[container_instance_arn]
+                    containerInstances=[container_instance_arn],
                 )
                 ec2_id = ci_resp["containerInstances"][0].get("ec2InstanceId")
                 if ec2_id:
-                    ec2_resp   = ec2.describe_instances(InstanceIds=[ec2_id])
+                    ec2_resp = await asyncio.to_thread(
+                        ec2.describe_instances, InstanceIds=[ec2_id],
+                    )
                     inst       = ec2_resp["Reservations"][0]["Instances"][0]
                     public_ip  = inst.get("PublicIpAddress")
                     private_ip = inst.get("PrivateIpAddress")
             except Exception:
-                pass
+                logger.warning("Failed to get EC2 IP for task %s", task_arn, exc_info=True)
 
         return {
             "task_arn":   task_arn,
@@ -189,7 +198,9 @@ async def get_task_status(task_arn: str) -> Optional[dict]:
 
 async def stop_user_task(task_arn: str, reason: str = "User requested stop") -> bool:
     try:
-        ecs.stop_task(cluster=ECS_CLUSTER, task=task_arn, reason=reason)
+        await asyncio.to_thread(
+            ecs.stop_task, cluster=ECS_CLUSTER, task=task_arn, reason=reason,
+        )
         return True
     except ClientError as e:
         if e.response["Error"]["Code"] == "InvalidParameterException":
@@ -205,7 +216,8 @@ async def generate_presigned_url(
         raise RuntimeError("S3_BUCKET not configured")
     key = f"workspaces/{user_id}/{filename}"
     try:
-        return s3.generate_presigned_url(
+        return await asyncio.to_thread(
+            s3.generate_presigned_url,
             ClientMethod=operation,
             Params={"Bucket": S3_BUCKET, "Key": key},
             ExpiresIn=expires,

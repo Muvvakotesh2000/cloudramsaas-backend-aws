@@ -3,6 +3,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import zipfile
 from typing import Optional
 
@@ -54,6 +55,22 @@ VNC_PASSWORD = os.getenv("VNC_PW", "cloudramsaas_vnc")
 VM_HTTP_TIMEOUT = int(os.getenv("VM_HTTP_TIMEOUT", "60"))
 VM_API_KEY = os.getenv("VM_API_KEY", "")
 
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))  # 500 MB
+
+_SAFE_PROJECT_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._\- ]{0,127}$")
+
+
+def _validate_project_name(name: str) -> str:
+    name = name.strip()
+    if not name or not _SAFE_PROJECT_NAME.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project name. Use letters, digits, dots, hyphens, underscores, or spaces (max 128 chars).",
+        )
+    if ".." in name:
+        raise HTTPException(status_code=400, detail="Invalid project name.")
+    return name
+
 _allocate_lock = asyncio.Lock()
 
 
@@ -82,17 +99,6 @@ async def _vm_request(session: dict, path: str, method: str = "POST", json_body:
             detail = resp.text
         raise HTTPException(status_code=resp.status_code, detail=detail)
     return resp.json()
-
-
-@router.get("/debug/aws_identity")
-async def debug_aws_identity(user: dict = Depends(get_current_user)):
-    sts = boto3.client("sts")
-    ident = sts.get_caller_identity()
-    return {
-        "account": ident.get("Account"),
-        "arn": ident.get("Arn"),
-        "user_id": user.get("user_id"),
-    }
 
 
 def _require_user_scoped_key(user_id: str, key: str):
@@ -489,9 +495,17 @@ async def vm_upload_project(
     user: dict = Depends(get_current_user),
 ):
     user_id = user["user_id"]
+    project_name = _validate_project_name(project_name)
 
     if ide not in SUPPORTED_IDES:
         raise HTTPException(status_code=400, detail=f"Unsupported IDE '{ide}'. Supported: {SUPPORTED_IDES}")
+
+    size = 0
+    chunk = await file.read(MAX_UPLOAD_BYTES + 1)
+    size = len(chunk)
+    if size > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB limit")
+    await file.seek(0)
 
     s3_key = f"users/{user_id}/vscode/{project_name}.zip"
     config_key = f"users/{user_id}/vscode/_empty_config.zip"
@@ -585,7 +599,7 @@ async def vm_export_project(request: Request, user: dict = Depends(get_current_u
     if not session:
         raise HTTPException(status_code=404, detail="No active session")
     user_id = user["user_id"]
-    project_name = body.get("project_name", "")
+    project_name = _validate_project_name(body.get("project_name", ""))
     bucket = body.get("bucket", "cloudramsaas-vscode")
     s3_key = f"users/{user_id}/exports/{project_name}.zip"
 
