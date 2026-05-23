@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
-from src.db import init_db
+from src.db import init_db, cleanup_expired_sessions, recover_sessions_from_ecs
 from src.routes import router
 
 logging.basicConfig(
@@ -18,12 +19,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+IDLE_CHECK_INTERVAL = int(os.getenv("IDLE_CHECK_INTERVAL_SECONDS", "120"))
+
+
+async def _idle_session_reaper():
+    while True:
+        await asyncio.sleep(IDLE_CHECK_INTERVAL)
+        try:
+            count = await cleanup_expired_sessions()
+            if count:
+                logger.info("Idle reaper stopped %d expired session(s)", count)
+        except Exception as e:
+            logger.warning("Idle reaper error: %s", e)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("CloudRAMSaaS Backend starting...")
     await init_db()
+    await recover_sessions_from_ecs()
+    reaper_task = asyncio.create_task(_idle_session_reaper())
     yield
+    reaper_task.cancel()
     logger.info("CloudRAMSaaS Backend shutting down...")
 
 

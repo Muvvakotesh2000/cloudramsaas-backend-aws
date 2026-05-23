@@ -8,6 +8,7 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
+VM_API_KEY            = os.getenv("VM_API_KEY", "")
 AWS_REGION            = os.environ["AWS_REGION"]
 ECS_CLUSTER           = os.environ["ECS_CLUSTER"]
 ECS_TASK_DEFINITION   = os.environ["ECS_TASK_DEFINITION"]
@@ -98,6 +99,7 @@ async def run_user_task(user_id: str) -> dict:
                         {"name": "VNC_PORT",       "value": str(vnc_port)},
                         {"name": "API_PORT",       "value": str(api_port)},
                         {"name": "DISPLAY",        "value": display},
+                        {"name": "VM_API_KEY",     "value": VM_API_KEY},
                     ],
                 }]
             },

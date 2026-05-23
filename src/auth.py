@@ -1,19 +1,27 @@
 import logging
 import os
-from typing import Optional
 
 import httpx
 from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
 
 logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
-# Use service role key for server-side verification
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
 security = HTTPBearer()
+
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        )
+    return _http_client
 
 
 async def get_current_user(
@@ -21,13 +29,28 @@ async def get_current_user(
 ) -> dict:
     """Validate Bearer token via Supabase /auth/v1/user endpoint."""
     token = credentials.credentials
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(
-            f"{SUPABASE_URL}/auth/v1/user",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            },
+    client = _get_client()
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                },
+            )
+            break
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            last_err = e
+            logger.warning("Supabase auth attempt %d failed: %s", attempt + 1, e)
+            continue
+    else:
+        logger.error("Supabase auth failed after 3 attempts: %s", last_err)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Authentication service temporarily unavailable",
         )
 
     if resp.status_code != 200:

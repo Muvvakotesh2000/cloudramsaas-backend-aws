@@ -1,11 +1,15 @@
 # backend/src/routes.py
 import asyncio
+import io
 import logging
 import os
+import zipfile
 from typing import Optional
 
 import boto3
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+import httpx
+from botocore.exceptions import ClientError
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel
 
 from src.auth import get_current_user
@@ -23,11 +27,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # =============================================================================
-# S3 presign configuration (for Local Agent)
+# Config
 # =============================================================================
 S3_PRESIGN_EXPIRES_SECONDS = int(os.getenv("S3_PRESIGN_EXPIRES_SECONDS", "300"))
 
-# Example: ALLOWED_S3_BUCKETS="notepadfiles,cloudramsaas-vscode"
 ALLOWED_S3_BUCKETS = [
     b.strip()
     for b in os.getenv("ALLOWED_S3_BUCKETS", "notepadppfiles,cloudramsaas-vscode").split(",")
@@ -45,6 +48,39 @@ ALLOWED_PRESIGN_CONTENT_TYPES = [
 
 AWS_REGION = os.getenv("AWS_REGION")
 s3_client = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
+
+VNC_PASSWORD = os.getenv("VNC_PW", "cloudramsaas_vnc")
+VM_HTTP_TIMEOUT = int(os.getenv("VM_HTTP_TIMEOUT", "60"))
+VM_API_KEY = os.getenv("VM_API_KEY", "")
+
+_allocate_lock = asyncio.Lock()
+
+
+def _build_novnc_url(ip: str, port: int) -> str:
+    return f"http://{ip}:{port}/vnc.html?autoconnect=true&password={VNC_PASSWORD}&resize=scale"
+
+
+async def _vm_request(session: dict, path: str, method: str = "POST", json_body: dict = None):
+    vm_ip = session.get("private_ip")
+    api_port = session.get("api_port", 7000)
+    if not vm_ip:
+        raise HTTPException(status_code=503, detail="VM IP not available yet")
+    url = f"http://{vm_ip}:{api_port}{path}"
+    headers = {}
+    if VM_API_KEY:
+        headers["X-VM-API-KEY"] = VM_API_KEY
+    async with httpx.AsyncClient(timeout=VM_HTTP_TIMEOUT) as client:
+        if method == "GET":
+            resp = await client.get(url, headers=headers)
+        else:
+            resp = await client.post(url, json=json_body, headers=headers)
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    return resp.json()
 
 
 @router.get("/debug/aws_identity")
@@ -162,7 +198,11 @@ async def allocate_session(
 ):
     user_id = user["user_id"]
 
-    # Return existing active session if any
+    async with _allocate_lock:
+        return await _do_allocate(user_id, background_tasks)
+
+
+async def _do_allocate(user_id: str, background_tasks: BackgroundTasks) -> SessionResponse:
     existing = await get_active_session(user_id)
     if existing:
         info = await get_task_status(existing["task_arn"])
@@ -174,7 +214,7 @@ async def allocate_session(
             api_port = (info.get("api_port") if info else None) or existing.get("api_port")
 
             novnc_url = (
-                f"http://{reachable_ip}:{novnc_port}/vnc.html"
+                _build_novnc_url(reachable_ip, novnc_port)
                 if ecs_status == "RUNNING" and reachable_ip
                 else None
             )
@@ -248,7 +288,7 @@ async def session_status(user: dict = Depends(get_current_user)):
         ecs_status = session["status"]
 
     novnc_url = (
-        f"http://{reachable_ip}:{novnc_port}/vnc.html"
+        _build_novnc_url(reachable_ip, novnc_port)
         if ecs_status == "RUNNING" and reachable_ip
         else None
     )
@@ -350,6 +390,170 @@ async def s3_sign_get(req: S3SignGetRequest, user: dict = Depends(get_current_us
         raise HTTPException(status_code=500, detail=f"Failed to presign GET URL: {str(e)}")
 
     return {"url": url, "expires_in": S3_PRESIGN_EXPIRES_SECONDS}
+
+
+# =============================================================================
+# VM proxy routes  (browser → backend → container API, avoids CORS)
+# =============================================================================
+SUPPORTED_IDES = ["vscode", "sublime", "eclipse", "intellij", "pycharm"]
+
+
+@router.post("/vm/upload_project")
+async def vm_upload_project(
+    file: UploadFile = File(...),
+    project_name: str = Form(...),
+    ide: str = Form("vscode"),
+    user: dict = Depends(get_current_user),
+):
+    user_id = user["user_id"]
+
+    if ide not in SUPPORTED_IDES:
+        raise HTTPException(status_code=400, detail=f"Unsupported IDE '{ide}'. Supported: {SUPPORTED_IDES}")
+
+    s3_key = f"users/{user_id}/vscode/{project_name}.zip"
+    config_key = f"users/{user_id}/vscode/_empty_config.zip"
+
+    try:
+        await asyncio.to_thread(
+            s3_client.upload_fileobj,
+            file.file,
+            "cloudramsaas-vscode",
+            s3_key,
+            {"ContentType": "application/zip"},
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w"):
+            pass
+        buf.seek(0)
+        await asyncio.to_thread(
+            s3_client.upload_fileobj,
+            buf,
+            "cloudramsaas-vscode",
+            config_key,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
+
+    session = await get_active_session(user_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="No active session")
+
+    return await _vm_request(session, "/setup_ide", json_body={
+        "user_id": user_id,
+        "project_name": project_name,
+        "ide": ide,
+        "project_s3_bucket": "cloudramsaas-vscode",
+        "project_s3_key": s3_key,
+        "config_s3_bucket": "cloudramsaas-vscode",
+        "config_s3_key": config_key,
+    })
+
+
+@router.post("/vm/setup_ide")
+async def vm_setup_ide(request: Request, user: dict = Depends(get_current_user)):
+    body = await request.json()
+    session = await get_active_session(user["user_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="No active session")
+    body["user_id"] = user["user_id"]
+    return await _vm_request(session, "/setup_ide", json_body=body)
+
+
+# Backward-compatible alias
+@router.post("/vm/setup_vscode")
+async def vm_setup_vscode(request: Request, user: dict = Depends(get_current_user)):
+    body = await request.json()
+    body["ide"] = "vscode"
+    session = await get_active_session(user["user_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="No active session")
+    body["user_id"] = user["user_id"]
+    return await _vm_request(session, "/setup_ide", json_body=body)
+
+
+@router.get("/vm/setup_status/{job_id}")
+async def vm_setup_status(job_id: str, user: dict = Depends(get_current_user)):
+    session = await get_active_session(user["user_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="No active session")
+    return await _vm_request(session, f"/ide_setup_status/{job_id}", method="GET")
+
+
+@router.get("/vm/available_ides")
+async def vm_available_ides(user: dict = Depends(get_current_user)):
+    session = await get_active_session(user["user_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="No active session")
+    return await _vm_request(session, "/available_ides", method="GET")
+
+
+@router.get("/vm/projects")
+async def vm_list_projects(user: dict = Depends(get_current_user)):
+    session = await get_active_session(user["user_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="No active session")
+    return await _vm_request(session, f"/list_projects/{user['user_id']}", method="GET")
+
+
+@router.post("/vm/export_project")
+async def vm_export_project(request: Request, user: dict = Depends(get_current_user)):
+    body = await request.json()
+    session = await get_active_session(user["user_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="No active session")
+    user_id = user["user_id"]
+    project_name = body.get("project_name", "")
+    bucket = body.get("bucket", "cloudramsaas-vscode")
+    s3_key = f"users/{user_id}/exports/{project_name}.zip"
+
+    try:
+        await asyncio.to_thread(
+            s3_client.head_object, Bucket=bucket, Key=s3_key,
+        )
+        return {"bucket": bucket, "key": s3_key}
+    except ClientError:
+        pass
+
+    body["user_id"] = user_id
+    return await _vm_request(session, "/export_project", json_body=body)
+
+
+# =============================================================================
+# IDE config persistence
+# =============================================================================
+@router.post("/vm/save_ide_config")
+async def vm_save_ide_config(request: Request, user: dict = Depends(get_current_user)):
+    body = await request.json()
+    session = await get_active_session(user["user_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="No active session")
+    ide = body.get("ide", "vscode")
+    if ide not in SUPPORTED_IDES:
+        raise HTTPException(status_code=400, detail=f"Unsupported IDE '{ide}'")
+    return await _vm_request(session, "/save_ide_config", json_body={
+        "user_id": user["user_id"],
+        "ide": ide,
+    })
+
+
+@router.post("/vm/save_all_ide_configs")
+async def vm_save_all_ide_configs(user: dict = Depends(get_current_user)):
+    session = await get_active_session(user["user_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="No active session")
+    vm_ip = session.get("private_ip")
+    api_port = session.get("api_port", 7000)
+    if not vm_ip:
+        raise HTTPException(status_code=503, detail="VM IP not available yet")
+    url = f"http://{vm_ip}:{api_port}/save_all_ide_configs?user_id={user['user_id']}"
+    headers = {}
+    if VM_API_KEY:
+        headers["X-VM-API-KEY"] = VM_API_KEY
+    async with httpx.AsyncClient(timeout=VM_HTTP_TIMEOUT) as client:
+        resp = await client.post(url, headers=headers)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
 
 
 # =============================================================================
