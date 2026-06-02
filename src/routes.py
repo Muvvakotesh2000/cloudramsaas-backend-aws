@@ -446,7 +446,7 @@ async def beacon_stop_session(request: Request):
 
 
 # =============================================================================
-# S3 Presigned URL routes (Local Agent uses these)
+# S3 Presigned URL routes
 #   POST /api/v1/s3/sign_put
 #   POST /api/v1/s3/sign_get
 # =============================================================================

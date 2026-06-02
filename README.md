@@ -82,8 +82,6 @@ Browser / Frontend
 │   ├── aws.py             # ECS RunTask/StopTask, S3 presign, random port allocation
 │   ├── db.py              # Session CRUD (asyncpg or in-memory), ECS recovery on startup
 │   └── routes.py          # All API route handlers, VM proxy, S3 signing
-├── applications/
-│   └── CloudRAMSaaS-Agent.exe
 ├── requirements.txt
 ├── .python-version        # Python 3.11 (for Render)
 └── .env                   # Environment variables (not committed)
