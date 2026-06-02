@@ -5,7 +5,9 @@ import logging
 import os
 import re
 import zipfile
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import boto3
 import httpx
@@ -72,6 +74,12 @@ def _validate_project_name(name: str) -> str:
     return name
 
 _allocate_lock = asyncio.Lock()
+_PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def _is_within_working_hours() -> bool:
+    now = datetime.now(_PACIFIC)
+    return now.weekday() < 5 and 6 <= now.hour < 17
 
 
 def _build_novnc_url(ip: str, port: int) -> str:
@@ -288,6 +296,11 @@ async def allocate_session(
     background_tasks: BackgroundTasks,
     user: dict = Depends(get_current_user),
 ):
+    if not _is_within_working_hours():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cloud desktops are available Mon–Fri, 6 AM – 5 PM Pacific Time.",
+        )
     user_id = user["user_id"]
 
     async with _allocate_lock:
